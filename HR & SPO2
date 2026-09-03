@@ -1,0 +1,176 @@
+#include <Wire.h>
+#include "MAX30100.h"
+
+MAX30100 sensor;
+
+// ---- Adaptive peak detection (BPM) ----
+uint16_t irMax = 0, irMin = 65535;
+uint16_t redMax = 0, redMin = 65535;
+uint16_t thresholdHigh = 0, thresholdLow = 0;
+bool peakDetected = false;
+
+unsigned long t1 = 0, t2 = 0;
+unsigned long lastRangeUpdate = 0;
+const unsigned long RANGE_RESET_INTERVAL = 3000; // 3 sec window
+
+// ---- Finger detection ----
+const uint16_t FINGER_THRESHOLD = 2000;  // tune based on your sensor's baseline
+bool fingerPresent = false;
+
+// ---- BPM averaging ----
+const int NUM_SAMPLES = 5;
+float bpmReadings[NUM_SAMPLES];
+int bpmIndex = 0;
+int bpmCount = 0;
+
+// ---- SpO2 averaging ----
+float spo2Readings[NUM_SAMPLES];
+int spo2Index = 0;
+int spo2Count = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  Serial.print("Initializing MAX30100...");
+  if (!sensor.begin()) {
+    Serial.println("FAILED");
+    while (1);
+  } else {
+    Serial.println("SUCCESS");
+  }
+
+  sensor.setMode(MAX30100_MODE_SPO2_HR);
+  sensor.setLedsCurrent(MAX30100_LED_CURR_50MA, MAX30100_LED_CURR_37MA);
+  sensor.setLedsPulseWidth(MAX30100_SPC_PW_1600US_16BITS);
+  sensor.setSamplingRate(MAX30100_SAMPRATE_100HZ);
+  sensor.setHighresModeEnabled(true);
+
+  lastRangeUpdate = millis();
+}
+
+void loop() {
+  uint16_t irValue, redValue;
+  sensor.update();
+
+  if (sensor.getRawValues(&irValue, &redValue)) {
+
+    if (irValue < FINGER_THRESHOLD) {
+      if (fingerPresent) {
+        resetDetection();
+      }
+      fingerPresent = false;
+      Serial.println("No finger detected");
+    } else {
+      fingerPresent = true;
+      updateRange(irValue, redValue);
+      detectBeat(irValue);
+    }
+  }
+}
+
+void resetDetection() {
+  irMax = 0; irMin = 65535;
+  redMax = 0; redMin = 65535;
+  thresholdHigh = 0; thresholdLow = 0;
+  peakDetected = false;
+  t1 = 0; t2 = 0;
+  bpmIndex = 0; bpmCount = 0;
+  spo2Index = 0; spo2Count = 0;
+  lastRangeUpdate = millis();
+}
+
+void updateRange(uint16_t irValue, uint16_t redValue) {
+  if (irValue > irMax) irMax = irValue;
+  if (irValue < irMin) irMin = irValue;
+  if (redValue > redMax) redMax = redValue;
+  if (redValue < redMin) redMin = redValue;
+
+  if (millis() - lastRangeUpdate > RANGE_RESET_INTERVAL) {
+    uint16_t irRange = irMax - irMin;
+    uint16_t redRange = redMax - redMin;
+
+    if (irRange > 50) {
+      thresholdHigh = irMin + (irRange * 0.6);
+      thresholdLow  = irMin + (irRange * 0.4);
+    }
+
+    if (irRange > 50 && redRange > 5) {
+      // ---- SpO2 calculation ----
+      float AC_IR  = irRange;
+      float DC_IR  = (irMax + irMin) / 2.0;
+      float AC_RED = redRange;
+      float DC_RED = (redMax + redMin) / 2.0;
+
+      // R = (AC_RED/DC_RED) / (AC_IR/DC_IR)
+      float R = (AC_RED / DC_RED) / (AC_IR / DC_IR);
+
+      // Empirical calibration formula (common approximation)
+      float SpO2 = 110.0 - 25.0 * R;
+      if (SpO2 > 100) SpO2 = 100;
+      if (SpO2 < 0) SpO2 = 0;
+
+      spo2Readings[spo2Index] = SpO2;
+      spo2Index = (spo2Index + 1) % NUM_SAMPLES;
+      if (spo2Count < NUM_SAMPLES) spo2Count++;
+
+      float spo2Average = getAverageSpO2();
+
+      Serial.print("R: "); Serial.print(R, 3);
+      Serial.print("   SpO2: "); Serial.print(SpO2, 1);
+      Serial.print(" %   SpO2 avg: "); Serial.print(spo2Average, 1);
+      Serial.println(" %");
+    }
+
+    irMax = 0; irMin = 65535;
+    redMax = 0; redMin = 65535;
+    lastRangeUpdate = millis();
+  }
+}
+
+void detectBeat(uint16_t irValue) {
+  if (thresholdHigh == 0) return;
+
+  if (irValue > thresholdHigh && !peakDetected) {
+    peakDetected = true;
+
+    if (t1 == 0) {
+      t1 = millis();
+    } else {
+      t2 = millis();
+      unsigned long deltaT = t2 - t1;
+
+      if (deltaT > 300 && deltaT < 2000) {
+        float BPM = 60000.0 / deltaT;
+
+        bpmReadings[bpmIndex] = BPM;
+        bpmIndex = (bpmIndex + 1) % NUM_SAMPLES;
+        if (bpmCount < NUM_SAMPLES) bpmCount++;
+
+        float bpmAverage = getAverageBPM();
+
+        Serial.print("Δt: "); Serial.print(deltaT);
+        Serial.print(" ms   BPM: "); Serial.print(BPM, 1);
+        Serial.print("   BPM avg: "); Serial.println(bpmAverage, 1);
+      }
+
+      t1 = t2;
+    }
+  }
+
+  if (irValue < thresholdLow) {
+    peakDetected = false;
+  }
+}
+
+float getAverageBPM() {
+  float sum = 0;
+  for (int i = 0; i < bpmCount; i++) sum += bpmReadings[i];
+  return sum / bpmCount;
+}
+
+float getAverageSpO2() {
+  float sum = 0;
+  for (int i = 0; i < spo2Count; i++) sum += spo2Readings[i];
+  return sum / spo2Count;
+}
