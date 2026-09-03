@@ -1,0 +1,120 @@
+// FOR ESP-32
+
+
+
+
+#include <Wire.h>
+#include <U8g2lib.h>
+
+//TwoWire Wire(0);   // this board's core requires explicit instantiation
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+#define BUTTON_PIN 18   // BTN1 (GPIO18) - dedicated to display paging
+
+int currentScreen = 1;          // which slide is showing (1-4)
+bool displayAwake = true;
+unsigned long lastActivity = 0;
+const unsigned long SLEEP_TIMEOUT = 30000;   // 30 seconds
+
+bool lastButtonState = HIGH;
+
+void drawScreen1() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(0, 14, "Critical Info");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 30, "Status: NORMAL");
+  u8g2.drawStr(0, 44, "HR: -- SpO2: --");
+  u8g2.drawStr(0, 58, "Battery: --");
+  u8g2.sendBuffer();
+}
+
+void drawScreen2() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(0, 14, "Medical Profile");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 30, "Name: --");
+  u8g2.drawStr(0, 44, "Age: -- Blood: --");
+  u8g2.drawStr(0, 58, "Allergy: --");
+  u8g2.sendBuffer();
+}
+
+void drawScreen3() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(0, 14, "Emergency Contact");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 30, "Supervisor: --");
+  u8g2.drawStr(0, 44, "Location/Sector: --");
+  u8g2.sendBuffer();
+}
+
+void drawScreen4() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(0, 14, "Diagnostics");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 30, "WiFi: --");
+  u8g2.drawStr(0, 44, "Last Sync: --");
+  u8g2.drawStr(0, 58, "Sensor Health: --");
+  u8g2.sendBuffer();
+}
+
+void showCurrentScreen() {
+  switch (currentScreen) {
+    case 1: drawScreen1(); break;
+    case 2: drawScreen2(); break;
+    case 3: drawScreen3(); break;
+    case 4: drawScreen4(); break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin();
+  u8g2.begin();
+
+  lastActivity = millis();
+  showCurrentScreen();
+
+  Serial.println("Display Manager ready. Button = GPIO18");
+}
+
+void loop() {
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+
+  if (currentButtonState == LOW && lastButtonState == HIGH) {
+    lastActivity = millis();
+
+    if (!displayAwake) {
+      u8g2.setPowerSave(0);
+      displayAwake = true;
+      showCurrentScreen();
+      Serial.println("Display woke up");
+    } else {
+      currentScreen++;
+      if (currentScreen > 4) currentScreen = 1;
+      showCurrentScreen();
+      Serial.print("Showing screen ");
+      Serial.println(currentScreen);
+    }
+
+    delay(200);
+  }
+
+  if (displayAwake && (millis() - lastActivity > SLEEP_TIMEOUT)) {
+    u8g2.setPowerSave(1);
+    displayAwake = false;
+    Serial.println("Display sleeping (30s idle)");
+  }
+
+  lastButtonState = currentButtonState;
+}
+//oled
+
+
