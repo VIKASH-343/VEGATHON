@@ -1,0 +1,215 @@
+// steps of the MQ-135 sensor to get the correct reading
+
+code 1
+
+const int MQ135_PIN = 34;   // ADC1 channel, input-only pin
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);      // ESP32 ADC is 12-bit (0-4095)
+  analogSetAttenuation(ADC_11db); // allows full 0-3.3V range
+}
+
+void loop() {
+  int rawValue = analogRead(MQ135_PIN);
+  float voltage = rawValue * (3.3 / 4095.0);
+
+  Serial.print("Raw ADC: ");
+  Serial.print(rawValue);
+  Serial.print("   Voltage: ");
+  Serial.print(voltage, 3);
+  Serial.println(" V");
+
+  delay(500);
+}
+
+code 2
+
+const int MQ135_PIN = 34;
+
+// ---- Circuit constants ----
+const float VCC = 3.3;      // Supply voltage to sensor (3.3 or 5.0)
+const float RL = 10.0;      // Load resistor on MQ135 module, in kΩ (check your board, often 10k or 20k)
+
+// ---- Calibration constant ----
+// R0 = sensor resistance in CLEAN AIR. You must calibrate this once (see note below).
+float R0 = 76.63;           // <-- placeholder, replace with YOUR calibrated value
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+}
+
+void loop() {
+  int rawADC = readAverageADC(MQ135_PIN, 10);
+  float voltage = rawADC * (VCC / 4095.0);
+
+  // Avoid divide-by-zero if voltage is 0
+  float RS = 999999;
+  if (voltage > 0.01) {
+    RS = ((VCC - voltage) / voltage) * RL;
+  }
+
+  float ratio = RS / R0;
+
+  Serial.print("ADC: ");
+  Serial.print(rawADC);
+  Serial.print("  V: ");
+  Serial.print(voltage, 3);
+  Serial.print("  RS: ");
+  Serial.print(RS, 2);
+  Serial.print(" kΩ  Ratio(RS/R0): ");
+  Serial.println(ratio, 3);
+
+  delay(1000);
+}
+
+int readAverageADC(int pin, int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(5);
+  }
+  return sum / samples;
+}
+
+code 3
+
+const int MQ135_PIN = 34;
+
+// ---- Circuit constants ----
+const float VCC = 3.3;
+const float RL = 10.0;      // kΩ, check your module's load resistor
+
+// ---- Calibration ----
+float R0 = 76.63;           // <-- YOUR calibrated value from clean-air test
+
+// ---- CO2 curve constants (datasheet power curve) ----
+const float PARA = 116.6020682;
+const float PARB = -2.769034857;
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+}
+
+void loop() {
+  int rawADC = readAverageADC(MQ135_PIN, 10);
+  float voltage = rawADC * (VCC / 4095.0);
+
+  float RS = 999999;
+  if (voltage > 0.01) {
+    RS = ((VCC - voltage) / voltage) * RL;
+  }
+
+  float ratio = RS / R0;
+  float ppm = PARA * pow(ratio, PARB);
+
+  String quality = getAirQuality(ppm);
+
+  Serial.print("ADC: ");
+  Serial.print(rawADC);
+  Serial.print("  RS: ");
+  Serial.print(RS, 2);
+  Serial.print("  Ratio: ");
+  Serial.print(ratio, 3);
+  Serial.print("  CO2 PPM: ");
+  Serial.print(ppm, 1);
+  Serial.print("  Air Quality: ");
+  Serial.println(quality);
+
+  delay(1000);
+}
+
+int readAverageADC(int pin, int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(5);
+  }
+  return sum / samples;
+}
+
+String getAirQuality(float ppm) {
+  if (ppm < 800) {
+    return "GOOD";
+  } else if (ppm < 1200) {
+    return "MODERATE";
+  } else if (ppm < 2000) {
+    return "POOR";
+  } else {
+    return "BAD / HAZARDOUS";
+  }
+}
+
+perfect code for MQ-135
+
+const int MQ135_PIN = 34;
+
+// ---- Circuit constants ----
+const float VCC = 3.3;
+const float RL = 20.0;      // kΩ, check your module's load resistor
+
+// ---- Calibration ----
+float R0 = 76.63;           // <-- YOUR calibrated value from clean-air test
+
+// ---- CO2 curve constants (datasheet power curve) ----
+const float PARA = 116.6020682;
+const float PARB = -2.769034857;
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+}
+
+void loop() {
+  int rawADC = readAverageADC(MQ135_PIN, 10);
+  float voltage = rawADC * (VCC / 4095.0);
+
+  float RS = 999999;
+  if (voltage > 0.01) {
+    RS = ((VCC - voltage) / voltage) * RL;
+  }
+
+  float ratio = RS / R0;
+  float ppm = PARA * pow(ratio, PARB);
+
+  String quality = getAirQuality(ppm);
+
+  Serial.print("ADC: ");
+  Serial.print(rawADC);
+  Serial.print("  RS: ");
+  Serial.print(RS, 2);
+  Serial.print("  Ratio: ");
+  Serial.print(ratio, 3);
+  Serial.print("  PPM: ");
+  Serial.print(ppm, 1);
+  Serial.print("  Air Quality: ");
+  Serial.println(quality);
+
+  delay(1000);
+}
+
+int readAverageADC(int pin, int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(5);
+  }
+  return sum / samples;
+}
+
+String getAirQuality(float ppm) {
+  if (ppm < 800) {
+    return "GOOD";
+  } else if (ppm < 1200) {
+    return "MODERATE";
+  } else if (ppm < 2000) {
+    return "POOR";
+  } else {
+    return "BAD / HAZARDOUS";
+  }
+}
