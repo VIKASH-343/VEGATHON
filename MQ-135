@@ -219,14 +219,33 @@ const int MQ135_PIN = 34;
 
 // ---- Circuit constants ----
 const float VCC = 3.3;
-const float RL = 20.0;      // kΩ, check your module's load resistor
+const float RL = 20.0;
 
 // ---- Calibration ----
-float R0 = 76.63;           // <-- YOUR calibrated value from clean-air test
+float R0 = 76.63;
 
-// ---- CO2 curve constants (datasheet power curve) ----
+// ---- CO2 curve constants ----
 const float PARA = 116.6020682;
 const float PARB = -2.769034857;
+
+// ---- Exposure limit constants ----
+const float PEL_TWA    = 5000.0;
+const float STEL_LIMIT = 30000.0;
+const float IDLH_LIMIT = 50000.0;
+
+// ---- Safety clamps to prevent garbage/inf values ----
+const float MIN_RATIO = 0.02;     // prevents divide-by-zero -> inf in pow()
+const float MAX_PPM   = 60000.0;  // cap displayed/stored PPM to a sane ceiling
+
+// ---- Rolling TWA buffer ----
+const unsigned long TWA_WINDOW_MS = 15UL * 60UL * 1000UL;
+const unsigned long SAMPLE_INTERVAL_MS = 1000;
+const int TWA_BUFFER_SIZE = TWA_WINDOW_MS / SAMPLE_INTERVAL_MS;
+
+float twaBuffer[TWA_BUFFER_SIZE];
+int twaIndex = 0;
+int twaCount = 0;
+const int MIN_SAMPLES_FOR_TWA = 60;
 
 void setup() {
   Serial.begin(115200);
@@ -236,30 +255,54 @@ void setup() {
 
 void loop() {
   int rawADC = readAverageADC(MQ135_PIN, 10);
-  float voltage = rawADC * (VCC / 4095.0);
 
+  // ---- Detect sensor fault / saturation FIRST ----
+  bool sensorFault = (rawADC >= 4090);  // essentially pegged at max = bad reading
+
+  float voltage = rawADC * (VCC / 4095.0);
   float RS = 999999;
-  if (voltage > 0.01) {
+  if (voltage > 0.05) {
     RS = ((VCC - voltage) / voltage) * RL;
   }
 
   float ratio = RS / R0;
-  float ppm = PARA * pow(ratio, PARB);
+  if (ratio < MIN_RATIO) ratio = MIN_RATIO;   // <-- prevents inf/huge numbers
 
-  String quality = getAirQuality(ppm);
+  float instantPPM = PARA * pow(ratio, PARB);
+  if (instantPPM > MAX_PPM) instantPPM = MAX_PPM;  // <-- cap so it can't poison the buffer
+
+  if (sensorFault) instantPPM = MAX_PPM;  // treat a pegged ADC as worst-case, not "inf"
+
+  // ---- Update TWA buffer with the CLEAN value ----
+  twaBuffer[twaIndex] = instantPPM;
+  twaIndex = (twaIndex + 1) % TWA_BUFFER_SIZE;
+  if (twaCount < TWA_BUFFER_SIZE) twaCount++;
+
+  float twaPPM = getTWA();
+
+  // ---- Determine deterministic danger mode ----
+  String mode = getDangerMode(instantPPM, twaPPM, twaCount, sensorFault);
+
+  // ---- Legacy label (kept as a separate, secondary system) ----
+  String legacy = getLegacyLabel(instantPPM, twaPPM, twaCount);
 
   Serial.print("ADC: ");
   Serial.print(rawADC);
-  Serial.print("  RS: ");
-  Serial.print(RS, 2);
-  Serial.print("  Ratio: ");
-  Serial.print(ratio, 3);
-  Serial.print("  PPM: ");
-  Serial.print(ppm, 1);
-  Serial.print("  Air Quality: ");
-  Serial.println(quality);
+  Serial.print("  Instant PPM: ");
+  Serial.print(instantPPM, 1);
+  Serial.print("  TWA(");
+  Serial.print(twaCount);
+  Serial.print("/");
+  Serial.print(TWA_BUFFER_SIZE);
+  Serial.print("): ");
+  Serial.print(twaPPM, 1);
+  Serial.print("  MODE: ");
+  Serial.print(mode);
+  Serial.print("  [legacy: ");
+  Serial.print(legacy);
+  Serial.println("]");
 
-  delay(1000);
+  delay(SAMPLE_INTERVAL_MS);
 }
 
 int readAverageADC(int pin, int samples) {
@@ -271,14 +314,42 @@ int readAverageADC(int pin, int samples) {
   return sum / samples;
 }
 
-String getAirQuality(float ppm) {
-  if (ppm < 800) {
-    return "GOOD";
-  } else if (ppm < 1200) {
-    return "MODERATE";
-  } else if (ppm < 2000) {
-    return "POOR";
-  } else {
-    return "BAD / HAZARDOUS";
+float getTWA() {
+  float sum = 0;
+  for (int i = 0; i < twaCount; i++) sum += twaBuffer[i];
+  return sum / twaCount;
+}
+
+// ---- NEW: deterministic 4-level danger mode ----
+String getDangerMode(float instantPPM, float twaPPM, int sampleCount, bool sensorFault) {
+  if (sensorFault) return "EMERGENCY (sensor fault/saturated)";
+
+  // Immediate spike -> EMERGENCY
+  if (instantPPM >= IDLH_LIMIT) return "EMERGENCY";
+  if (instantPPM >= STEL_LIMIT) return "EMERGENCY";
+
+  // Not enough data yet -> judge on instant reading only
+  if (sampleCount < MIN_SAMPLES_FOR_TWA) {
+    if (instantPPM >= PEL_TWA) return "CRITICAL";
+    else if (instantPPM >= 1000) return "WARNING";
+    else return "NORMAL";
   }
+
+  // Sustained average -> CRITICAL / WARNING / NORMAL
+  if (twaPPM >= PEL_TWA) return "CRITICAL";
+  else if (twaPPM >= 1000) return "WARNING";
+  else return "NORMAL";
+}
+
+// ---- Legacy GOOD/MODERATE/BAD label, kept separate ----
+String getLegacyLabel(float instantPPM, float twaPPM, int sampleCount) {
+  if (instantPPM >= STEL_LIMIT) return "BAD (STEL)";
+  if (sampleCount < MIN_SAMPLES_FOR_TWA) {
+    if (instantPPM >= PEL_TWA) return "BAD (PEL)";
+    else if (instantPPM >= 1000) return "MODERATE (PEL)";
+    else return "GOOD (PEL)";
+  }
+  if (twaPPM >= PEL_TWA) return "BAD (TWA)";
+  else if (twaPPM >= 1000) return "MODERATE (TWA)";
+  else return "GOOD (TWA)";
 }
