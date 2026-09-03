@@ -2,6 +2,8 @@
 
 code 1
 
+
+
 const int MQ135_PIN = 34;   // ADC1 channel, input-only pin
 
 void setup() {
@@ -23,7 +25,11 @@ void loop() {
   delay(500);
 }
 
+
+
 code 2
+
+
 
 const int MQ135_PIN = 34;
 
@@ -74,7 +80,11 @@ int readAverageADC(int pin, int samples) {
   return sum / samples;
 }
 
+
+
 code 3
+
+
 
 const int MQ135_PIN = 34;
 
@@ -144,7 +154,66 @@ String getAirQuality(float ppm) {
   }
 }
 
+
+
+calibrete RO
+
+
+
+const int MQ135_PIN = 34;
+
+// ---- Circuit constants ----
+const float VCC = 3.3;      // Supply voltage to sensor (match your setup: 3.3 or 5.0)
+const float RL = 20.0;      // kΩ, your module's load resistor value
+const float CLEAN_AIR_RATIO = 3.6;  // MQ-135 datasheet: RS/R0 in clean air ≈ 3.6
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  Serial.println("Warming up sensor... place in CLEAN AIR, away from smoke/alcohol/exhaust.");
+  Serial.println("Wait at least a few minutes for readings to stabilize.");
+  Serial.println();
+}
+
+void loop() {
+  float RS = getRS();
+  float R0 = RS / CLEAN_AIR_RATIO;
+
+  Serial.print("RS: ");
+  Serial.print(RS, 2);
+  Serial.print(" kΩ   ->   Calculated R0: ");
+  Serial.print(R0, 2);
+  Serial.println(" kΩ");
+
+  delay(1000);
+}
+
+float getRS() {
+  long sum = 0;
+  int samples = 50;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(MQ135_PIN);
+    delay(10);
+  }
+  int avgADC = sum / samples;
+
+  float voltage = avgADC * (VCC / 4095.0);
+
+  if (voltage < 0.01) voltage = 0.01;  // avoid divide-by-zero
+
+  float RS = ((VCC - voltage) / voltage) * RL;
+  return RS;
+}
+
+
+
+
 perfect code for MQ-135
+
+
+
 
 const int MQ135_PIN = 34;
 
