@@ -1,1 +1,992 @@
+/*
+ * VEGA Aries V2 -- Unified Worker Safety Node
+ * DHT11 + MQ135 + SOS button/buzzer + ADXL345 fall detection +
+ * MAX30100 HR/SpO2 (manual FIFO) + OLED paging display
+ * ---> E220-900T22D (LoRa) ---> ESP32 bridge ---> dashboard
+ *
+ * Merged from two separate sketches:
+ *   1) DHT11+MQ135+SOS-button/buzzer LoRa sender (UART1, GPIO4/A0/5/6)
+ *   2) ADXL345 fall detection + MAX30100 HR/SpO2 + OLED display
+ *      (I2C0/J10 shared bus, GPIO9/13)
+ *
+ * WIRING MAP (combined, no pin conflicts):
+ *   DHT11 DATA   -> GPIO4  (J2 pin 14)
+ *   MQ135 AOUT   -> A0     (J10 pin 2)
+ *   SOS Buzzer   -> GPIO5  (J2 pin 12)   -- manual SOS, button-toggled
+ *   SOS Button   -> GPIO6  (J2 pin 10, INPUT_PULLUP, other leg to GND)
+ *   OLED Button  -> GPIO9  (INPUT_PULLUP, other leg to GND) -- pages screens
+ *   Fall Alarm   -> GPIO13 -- separate from the SOS buzzer, auto-triggered
+ *   ADXL345, MAX30100, OLED all share I2C0 (J10): SDA->J10 pin10,
+ *     SCL->J10 pin12, with 4.7k pull-ups to 3.3V
+ *   E220 LoRa    -> Aries UART1 (RX1/TX1), M0/M1 -> GND
+ *
+ * CHANGES MADE WHILE MERGING (flagged explicitly, not silent):
+ *
+ * 1. Debug Serial baud unified to 115200 (the OLED/sensor file's rate) --
+ *    the DHT11/MQ135/SOS file used 9600. This only affects your USB
+ *    Serial Monitor setting, not any sensor or the LoRa UART (which stays
+ *    a separate, fixed 9600 regardless).
+ *
+ * 2. FALL packet field now reflects the REAL fall-alarm state
+ *    (FALL:1 while alarmActive, FALL:0 otherwise) instead of the
+ *    hardcoded "FALL:0" placeholder from the original LoRa sender.
+ *
+ * 3. HR/SPO2 fields are only included in the packet when a finger is
+ *    detected AND at least one valid sample has been averaged --
+ *    otherwise they're omitted entirely (not sent as 0), because 0 bpm
+ *    would falsely trip the dashboard's low-heart-rate CRITICAL alarm.
+ *    Same reasoning as the earlier DHT11+MQ135+MAX30100 merge.
+ *
+ * 4. NEITHER the ADXL345 nor the MAX30100 halts the board forever if it
+ *    fails to initialize (the OLED file's original MAX30100 failure did
+ *    via an infinite while(1)). Given what we found in the Aries core's
+ *    own Wire.cpp -- every I2C wait is an unbounded while() loop with NO
+ *    timeout -- repeatedly calling into a sensor that never ACKed is a
+ *    real hang risk, not just wasted time. So each sensor gets an
+ *    explicit ID check at startup (ADXL345: DEVID register == 0xE5,
+ *    MAX30100: getPartId() as before); if a sensor fails that check, its
+ *    *ok flag goes false and the rest of the loop never calls into it
+ *    again -- other telemetry (temp/humidity/gas/SOS) keeps flowing
+ *    either way.
+ */
+
+#include <Arduino.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include <U8g2lib.h>
+
+// ---------------- Worker identity ----------------
+const char* WORKER_ID   = "W001";
+const char* WORKER_NAME = "Worker1";
+const char* AUTH_TOKEN  = "VEGA_SECURE_2026";   // must match config.AUTH_TOKEN
+const uint8_t PROTOCOL_VERSION = 2;
+
+// ---------------- LoRa UART ----------------
+HardwareSerial LORA_SERIAL(1);
+#define LORA_BAUD   9600
+
+// ---------------- Shared I2C0 bus (ADXL345 + MAX30100 + OLED) ----------------
+TwoWire Wire(0);
+MAX30100 sensor;
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+// ---------------- DHT11 ----------------
+#define DHTPIN      4
+#define DHT_TIMEOUT 10000
+
+#define TEMP_EMERGENCY_LOW   5.0
+#define TEMP_CRITICAL_LOW    10.0
+#define TEMP_WARNING_LOW     15.0
+#define TEMP_WARNING_HIGH    40.0
+#define TEMP_CRITICAL_HIGH   45.0
+#define TEMP_EMERGENCY_HIGH  50.0
+
+#define HUM_EMERGENCY_LOW    10.0
+#define HUM_CRITICAL_LOW     20.0
+#define HUM_WARNING_LOW      30.0
+#define HUM_WARNING_HIGH     60.0
+#define HUM_CRITICAL_HIGH    70.0
+#define HUM_EMERGENCY_HIGH   80.0
+
+// ---------------- MQ135 (air quality) ----------------
+const int MQ135_PIN = A0;
+const bool RUN_CALIBRATION = false;
+
+const float MQ135_VCC = 3.3;
+const float MQ135_RL  = 20.0;
+const float ADC_MAX_RAW = 4095.0;
+
+float R0 = 76.63;
+
+const float MQ_PARA = 116.6020682;
+const float MQ_PARB = -2.769034857;
+const float CLEAN_AIR_PPM = 400.0;
+
+const float PEL_TWA    = 5000.0;
+const float STEL_LIMIT = 30000.0;
+const float IDLH_LIMIT = 50000.0;
+
+const float MIN_RATIO = 0.02;
+const float MAX_PPM   = 60000.0;
+
+const unsigned long TWA_WINDOW_MS = 15UL * 60UL * 1000UL;
+const unsigned long GAS_SAMPLE_INTERVAL_MS = 2000;
+const int TWA_BUFFER_SIZE = TWA_WINDOW_MS / GAS_SAMPLE_INTERVAL_MS;
+
+float twaBuffer[TWA_BUFFER_SIZE];
+int twaIndex = 0;
+int twaCount = 0;
+const int MIN_SAMPLES_FOR_TWA = 30;
+
+// ---------------- SOS button / buzzer ----------------
+#define BUZZERPIN 5
+#define BUTTONPIN 6
+
+bool sosActive = false;
+bool lastButtonReading = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 50;
+
+// ---------------- ADXL345 (fall detection) ----------------
+const uint8_t ADXL345_ADDR    = 0x53;
+const uint8_t REG_DEVID       = 0x00;
+const uint8_t REG_POWER_CTL   = 0x2D;
+const uint8_t REG_DATA_FORMAT = 0x31;
+const uint8_t REG_BW_RATE     = 0x2C;
+const uint8_t REG_DATAX0      = 0x32;
+const uint8_t ADXL345_DEVID_EXPECTED = 0xE5;
+
+bool adxlOk = false;  // set false if DEVID check fails -- fall detection skipped, board keeps running
+
+#define ALARM_PIN 13  // separate physical alarm from the SOS buzzer on GPIO5
+
+const float LFT_G = 0.4;
+const float UFT_G = 2.20;
+const unsigned long IMPACT_WINDOW_MS = 2000;
+const float POSTURE_CHANGE_THRESHOLD_G = 0.0;
+const unsigned long POSTURE_HOLD_MS    = 1500;
+const unsigned long BASELINE_SAMPLES   = 50;
+
+enum FallState { PRE_FALL, CRITICAL_PHASE, POST_IMPACT_POSTURE_CHECK };
+FallState fallState = PRE_FALL;
+bool alarmActive = false;
+
+unsigned long troughMs = 0;
+unsigned long postureCheckStartMs = 0;
+float verticalBaseline = 1.0;
+int verticalAxisIndex = 2;
+
+float velocityIntegral = 0.0;
+unsigned long lastAccelSampleMs = 0;
+
+// ---------------- MAX30100 (manual FIFO register access) ----------------
+const uint8_t MY_MAX30100_ADDR   = 0x57;
+const uint8_t MY_REG_FIFO_WR_PTR = 0x02;
+const uint8_t MY_REG_OVF_COUNTER = 0x03;
+const uint8_t MY_REG_FIFO_RD_PTR = 0x04;
+const uint8_t MY_REG_FIFO_DATA   = 0x05;
+const uint8_t MY_REG_INT_STATUS  = 0x00;
+
+bool hrSensorOk = false;  // set false if init fails -- HR/SPO2 skipped, board keeps running
+
+uint16_t irMax = 0, irMin = 65535;
+uint16_t redMax = 0, redMin = 65535;
+uint16_t thresholdHigh = 0, thresholdLow = 0;
+bool peakDetected = false;
+
+unsigned long t1 = 0, t2 = 0;
+unsigned long lastRangeUpdate = 0;
+const unsigned long RANGE_RESET_INTERVAL = 3000;
+
+uint16_t FINGER_THRESHOLD = 2000;
+bool fingerPresent = false;
+
+const int NUM_SAMPLES = 5;
+float bpmReadings[NUM_SAMPLES];
+int bpmIndex = 0;
+int bpmCount = 0;
+
+float spo2Readings[NUM_SAMPLES];
+int spo2Index = 0;
+int spo2Count = 0;
+
+float lastBPM = 0;
+float lastSpO2 = 0;
+
+// ---------------- OLED display manager (paging + sleep) ----------------
+#define OLED_BUTTON_PIN 9
+const int X_OFFSET = 8;
+
+int currentScreen = 1;
+bool displayAwake = true;
+unsigned long lastActivity = 0;
+const unsigned long SLEEP_TIMEOUT = 30000;
+bool lastOledButtonState = HIGH;
+
+unsigned long lastOledUpdate = 0;
+const unsigned long OLED_UPDATE_INTERVAL_MS = 300;
+
+// ---------------- Telemetry timing ----------------
+unsigned long lastTelemetryTime = 0;
+const unsigned long TELEMETRY_INTERVAL_MS = 2000;
+
+// ---------------- Boot / sequence tracking ----------------
+uint32_t bootId = 0;
+uint32_t seqNum = 0;
+
+// ---------------- CRC8 ----------------
+uint8_t crc8(const String &s) {
+  uint8_t crc = 0x00;
+  for (size_t i = 0; i < s.length(); i++) {
+    crc ^= (uint8_t)s[i];
+    for (uint8_t b = 0; b < 8; b++) {
+      if (crc & 0x80) crc = (uint8_t)((crc << 1) ^ 0x07);
+      else             crc = (uint8_t)(crc << 1);
+    }
+  }
+  return crc;
+}
+
+// ---------------- Float formatting (no dtostrf dependency) ----------------
+String floatToStr(float value, uint8_t decimals) {
+  bool neg = value < 0;
+  if (neg) value = -value;
+
+  unsigned long scale = 1;
+  for (uint8_t i = 0; i < decimals; i++) scale *= 10;
+
+  unsigned long scaled = (unsigned long)(value * scale + 0.5);
+  unsigned long intPart = scaled / scale;
+  unsigned long fracPart = scaled % scale;
+
+  String s = neg ? "-" : "";
+  s += String(intPart);
+  if (decimals > 0) {
+    String fracStr = String(fracPart);
+    while (fracStr.length() < decimals) fracStr = "0" + fracStr;
+    s += "." + fracStr;
+  }
+  return s;
+}
+
+// ---------------- SOS button check (non-blocking) ----------------
+void checkSosButton() {
+  bool currentReading = digitalRead(BUTTONPIN);
+
+  if (currentReading != lastButtonReading) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
+    static bool stableState = HIGH;
+
+    if (currentReading != stableState) {
+      stableState = currentReading;
+
+      if (stableState == LOW) {
+        sosActive = !sosActive;
+        digitalWrite(BUZZERPIN, sosActive ? HIGH : LOW);
+        Serial.println(sosActive ? "[aries] SOS ACTIVE - buzzer ON" : "[aries] SOS cleared - buzzer OFF");
+      }
+    }
+  }
+
+  lastButtonReading = currentReading;
+}
+
+// ---------------- DHT11 bit-bang read ----------------
+int waitForLevel(int level, unsigned long timeout) {
+  unsigned long start = micros();
+  while (digitalRead(DHTPIN) != level) {
+    if (micros() - start > timeout) return -1;
+  }
+  return micros() - start;
+}
+
+int readDHT11(float *temperature, float *humidity) {
+  uint8_t bits[5] = {0, 0, 0, 0, 0};
+
+  pinMode(DHTPIN, OUTPUT);
+  digitalWrite(DHTPIN, LOW);
+  delay(20);
+  digitalWrite(DHTPIN, HIGH);
+  delayMicroseconds(30);
+  pinMode(DHTPIN, INPUT);
+
+  if (waitForLevel(LOW, DHT_TIMEOUT) == -1) return -1;
+  if (waitForLevel(HIGH, DHT_TIMEOUT) == -1) return -1;
+  if (waitForLevel(LOW, DHT_TIMEOUT) == -1) return -1;
+
+  for (int i = 0; i < 40; i++) {
+    if (waitForLevel(HIGH, DHT_TIMEOUT) == -1) return -1;
+    int highTime = waitForLevel(LOW, DHT_TIMEOUT);
+    if (highTime == -1) return -1;
+
+    bits[i / 8] <<= 1;
+    if (highTime > 40) {
+      bits[i / 8] |= 1;
+    }
+  }
+
+  uint8_t checksum = bits[0] + bits[1] + bits[2] + bits[3];
+  if (checksum != bits[4]) return -2;
+
+  *humidity    = bits[0];
+  *temperature = bits[2];
+  return 0;
+}
+
+String classifyLevel(float v, float emergLow, float critLow, float warnLow,
+                      float warnHigh, float critHigh, float emergHigh) {
+  if (v <= emergLow || v >= emergHigh) return "EMERGENCY";
+  if (v <= critLow  || v >= critHigh)  return "CRITICAL";
+  if (v <= warnLow  || v >= warnHigh)  return "WARNING";
+  return "NORMAL";
+}
+
+// ---------------- MQ135 read + classification ----------------
+int readAverageADC(int pin, int samples) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delay(5);
+  }
+  return sum / samples;
+}
+
+float getTWA() {
+  float sum = 0;
+  for (int i = 0; i < twaCount; i++) sum += twaBuffer[i];
+  return sum / twaCount;
+}
+
+String readMQ135(float *instantPPMOut, float *twaPPMOut) {
+  int rawADC = readAverageADC(MQ135_PIN, 10);
+
+  bool sensorFault = (rawADC >= (int)(ADC_MAX_RAW - 5));
+
+  float voltage = rawADC * (MQ135_VCC / ADC_MAX_RAW);
+  float RS = 999999;
+  if (voltage > 0.05) {
+    RS = ((MQ135_VCC - voltage) / voltage) * MQ135_RL;
+  }
+
+  float ratio = RS / R0;
+  if (ratio < MIN_RATIO) ratio = MIN_RATIO;
+
+  float instantPPM = MQ_PARA * pow(ratio, MQ_PARB);
+  if (instantPPM > MAX_PPM) instantPPM = MAX_PPM;
+  if (sensorFault) instantPPM = MAX_PPM;
+
+  twaBuffer[twaIndex] = instantPPM;
+  twaIndex = (twaIndex + 1) % TWA_BUFFER_SIZE;
+  if (twaCount < TWA_BUFFER_SIZE) twaCount++;
+
+  float twaPPM = getTWA();
+
+  *instantPPMOut = instantPPM;
+  *twaPPMOut = twaPPM;
+
+  if (sensorFault) return "EMERGENCY";
+  if (instantPPM >= IDLH_LIMIT) return "EMERGENCY";
+  if (instantPPM >= STEL_LIMIT) return "EMERGENCY";
+
+  if (twaCount < MIN_SAMPLES_FOR_TWA) {
+    if (instantPPM >= PEL_TWA) return "CRITICAL";
+    if (instantPPM >= 1000)    return "WARNING";
+    return "NORMAL";
+  }
+
+  if (twaPPM >= PEL_TWA) return "CRITICAL";
+  if (twaPPM >= 1000)    return "WARNING";
+  return "NORMAL";
+}
+
+void calibrateR0() {
+  Serial.println("Calibrating R0... keep sensor in clean, ventilated air.");
+  float rsSum = 0;
+  const int samples = 50;
+  for (int i = 0; i < samples; i++) {
+    int raw = readAverageADC(MQ135_PIN, 10);
+    float voltage = raw * (MQ135_VCC / ADC_MAX_RAW);
+    float rs = 999999;
+    if (voltage > 0.05) {
+      rs = ((MQ135_VCC - voltage) / voltage) * MQ135_RL;
+    }
+    rsSum += rs;
+    Serial.print("Sample "); Serial.print(i + 1);
+    Serial.print("/"); Serial.print(samples);
+    Serial.print(" -- raw ADC: "); Serial.print(raw);
+    Serial.print(", RS: "); Serial.println(rs);
+    delay(1000);
+  }
+  float rsAvg = rsSum / samples;
+  float ratioAtBaseline = pow(CLEAN_AIR_PPM / MQ_PARA, 1.0 / MQ_PARB);
+  float newR0 = rsAvg / ratioAtBaseline;
+
+  Serial.println("---- Calibration complete ----");
+  Serial.print("Measured RS avg: "); Serial.println(rsAvg);
+  Serial.print("Suggested R0: "); Serial.println(newR0);
+  Serial.println("Copy this R0 value into the code, set RUN_CALIBRATION = false, and re-upload.");
+}
+
+// ---------------- ADXL345 ----------------
+void writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
+}
+
+uint8_t readRegister(uint8_t reg) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADXL345_ADDR, (uint8_t)1);
+  if (Wire.available()) return Wire.read();
+  return 0xFF;
+}
+
+void readAccel(float &gx, float &gy, float &gz) {
+  Wire.beginTransmission(ADXL345_ADDR);
+  Wire.write(REG_DATAX0);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADXL345_ADDR, (uint8_t)6);
+
+  int16_t rawX = Wire.read() | (Wire.read() << 8);
+  int16_t rawY = Wire.read() | (Wire.read() << 8);
+  int16_t rawZ = Wire.read() | (Wire.read() << 8);
+
+  const float SCALE = 0.0039;
+  gx = rawX * SCALE;
+  gy = rawY * SCALE;
+  gz = rawZ * SCALE;
+}
+
+void calibrateVerticalAxis() {
+  Serial.println("Calibrating vertical axis -- keep device still in its normal worn orientation...");
+  float sumX = 0, sumY = 0, sumZ = 0;
+  for (unsigned long i = 0; i < BASELINE_SAMPLES; i++) {
+    float gx, gy, gz;
+    readAccel(gx, gy, gz);
+    sumX += gx; sumY += gy; sumZ += gz;
+    delay(20);
+  }
+  float avgX = sumX / BASELINE_SAMPLES;
+  float avgY = sumY / BASELINE_SAMPLES;
+  float avgZ = sumZ / BASELINE_SAMPLES;
+
+  float absX = fabs(avgX), absY = fabs(avgY), absZ = fabs(avgZ);
+  if (absX >= absY && absX >= absZ) {
+    verticalAxisIndex = 0; verticalBaseline = avgX;
+  } else if (absY >= absX && absY >= absZ) {
+    verticalAxisIndex = 1; verticalBaseline = avgY;
+  } else {
+    verticalAxisIndex = 2; verticalBaseline = avgZ;
+  }
+
+  Serial.print("Vertical axis = ");
+  Serial.print(verticalAxisIndex == 0 ? "X" : (verticalAxisIndex == 1 ? "Y" : "Z"));
+  Serial.print(", baseline = ");
+  Serial.print(verticalBaseline, 3);
+  Serial.println("g");
+}
+
+// ---------------- MAX30100 manual FIFO reading ----------------
+uint8_t readMaxReg(uint8_t reg) {
+  Wire.beginTransmission(MY_MAX30100_ADDR);
+  Wire.write(reg);
+  uint8_t err = Wire.endTransmission(false);
+  if (err != 0) return 0xFF;
+  Wire.requestFrom((int)MY_MAX30100_ADDR, 1);
+  if (Wire.available()) return Wire.read();
+  return 0xFE;
+}
+
+void clearInterruptStatus() {
+  readMaxReg(MY_REG_INT_STATUS);
+}
+
+bool readMaxFifoSample(uint16_t *ir, uint16_t *red) {
+  uint8_t wr  = readMaxReg(MY_REG_FIFO_WR_PTR);
+  uint8_t rd  = readMaxReg(MY_REG_FIFO_RD_PTR);
+  uint8_t ovf = readMaxReg(MY_REG_OVF_COUNTER);
+
+  uint8_t numSamples = (wr - rd) & 0x0F;
+  if (numSamples == 0 && ovf > 0) {
+    numSamples = 16;
+  }
+  if (numSamples == 0) return false;
+
+  Wire.beginTransmission(MY_MAX30100_ADDR);
+  Wire.write(MY_REG_FIFO_DATA);
+  uint8_t err = Wire.endTransmission(false);
+  if (err != 0) {
+    Serial.print("[i2c-error] FIFO_DATA transmission failed, err="); Serial.println(err);
+    return false;
+  }
+  uint8_t got = Wire.requestFrom((int)MY_MAX30100_ADDR, 4);
+  if (got < 4) {
+    Serial.print("[i2c-error] requestFrom got only "); Serial.println(got);
+    return false;
+  }
+
+  uint8_t irMsb  = Wire.read();
+  uint8_t irLsb  = Wire.read();
+  uint8_t redMsb = Wire.read();
+  uint8_t redLsb = Wire.read();
+
+  *ir  = ((uint16_t)irMsb  << 8) | irLsb;
+  *red = ((uint16_t)redMsb << 8) | redLsb;
+  return true;
+}
+
+void resetDetection() {
+  irMax = 0; irMin = 65535;
+  redMax = 0; redMin = 65535;
+  thresholdHigh = 0; thresholdLow = 0;
+  peakDetected = false;
+  t1 = 0; t2 = 0;
+  bpmIndex = 0; bpmCount = 0;
+  spo2Index = 0; spo2Count = 0;
+  lastRangeUpdate = millis();
+}
+
+float getAverageBPM() {
+  float sum = 0;
+  for (int i = 0; i < bpmCount; i++) sum += bpmReadings[i];
+  return bpmCount ? sum / bpmCount : 0;
+}
+
+float getAverageSpO2() {
+  float sum = 0;
+  for (int i = 0; i < spo2Count; i++) sum += spo2Readings[i];
+  return spo2Count ? sum / spo2Count : 0;
+}
+
+void updateRange(uint16_t irValue, uint16_t redValue) {
+  if (irValue > irMax) irMax = irValue;
+  if (irValue < irMin) irMin = irValue;
+  if (redValue > redMax) redMax = redValue;
+  if (redValue < redMin) redMin = redValue;
+
+  if (millis() - lastRangeUpdate > RANGE_RESET_INTERVAL) {
+    uint16_t irRange = irMax - irMin;
+    uint16_t redRange = redMax - redMin;
+
+    if (irRange > 50) {
+      thresholdHigh = irMin + (irRange * 0.6);
+      thresholdLow  = irMin + (irRange * 0.4);
+    }
+
+    if (irRange > 50 && redRange > 5) {
+      float AC_IR  = irRange;
+      float DC_IR  = (irMax + irMin) / 2.0;
+      float AC_RED = redRange;
+      float DC_RED = (redMax + redMin) / 2.0;
+
+      float R = (AC_RED / DC_RED) / (AC_IR / DC_IR);
+      float SpO2 = 110.0 - 25.0 * R;
+      if (SpO2 > 100) SpO2 = 100;
+      if (SpO2 < 0) SpO2 = 0;
+
+      spo2Readings[spo2Index] = SpO2;
+      spo2Index = (spo2Index + 1) % NUM_SAMPLES;
+      if (spo2Count < NUM_SAMPLES) spo2Count++;
+
+      lastSpO2 = getAverageSpO2();
+    }
+
+    irMax = 0; irMin = 65535;
+    redMax = 0; redMin = 65535;
+    lastRangeUpdate = millis();
+  }
+}
+
+void detectBeat(uint16_t irValue) {
+  if (thresholdHigh == 0) return;
+
+  if (irValue > thresholdHigh && !peakDetected) {
+    peakDetected = true;
+    if (t1 == 0) {
+      t1 = millis();
+    } else {
+      t2 = millis();
+      unsigned long deltaT = t2 - t1;
+      if (deltaT > 300 && deltaT < 2000) {
+        float BPM = 60000.0 / deltaT;
+        bpmReadings[bpmIndex] = BPM;
+        bpmIndex = (bpmIndex + 1) % NUM_SAMPLES;
+        if (bpmCount < NUM_SAMPLES) bpmCount++;
+        lastBPM = getAverageBPM();
+      }
+      t1 = t2;
+    }
+  }
+
+  if (irValue < thresholdLow) {
+    peakDetected = false;
+  }
+}
+
+void handleHeartRate() {
+  if (!hrSensorOk) return;
+
+  uint16_t irValue, redValue;
+  int drainCount = 0;
+
+  while (readMaxFifoSample(&irValue, &redValue)) {
+    drainCount++;
+    if (drainCount > 20) {
+      Serial.println("[warn] drain loop hit cap of 20 - breaking out");
+      break;
+    }
+
+    if (irValue < FINGER_THRESHOLD) {
+      if (fingerPresent) {
+        resetDetection();
+        lastBPM = 0;
+        lastSpO2 = 0;
+      }
+      fingerPresent = false;
+    } else {
+      fingerPresent = true;
+      updateRange(irValue, redValue);
+      detectBeat(irValue);
+    }
+  }
+}
+
+// ---------------- OLED display manager ----------------
+void splitFloat(float value, int &whole, int &frac) {
+  whole = (int)value;
+  frac = (int)((value - whole) * 10);
+  if (frac < 0) frac = -frac;
+}
+
+void drawScreen1() {
+  u8g2.clearBuffer();
+
+  if (alarmActive) {
+    u8g2.setFont(u8g2_font_7x13B_tf);
+    u8g2.drawStr(X_OFFSET + 0, 24, "FALL DETECTED");
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(X_OFFSET + 0, 44, "Alarm active...");
+    u8g2.sendBuffer();
+    return;
+  }
+
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(X_OFFSET + 0, 14, "Critical Info");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(X_OFFSET + 0, 30, sosActive ? "Status: SOS ACTIVE" : "Status: NORMAL");
+
+  char hrLine[24];
+  if (!hrSensorOk) {
+    snprintf(hrLine, sizeof(hrLine), "HR sensor unavailable");
+  } else if (!fingerPresent) {
+    snprintf(hrLine, sizeof(hrLine), "No finger detected");
+  } else {
+    int bpmW, bpmF, spo2W, spo2F;
+    splitFloat(lastBPM, bpmW, bpmF);
+    splitFloat(lastSpO2, spo2W, spo2F);
+    snprintf(hrLine, sizeof(hrLine), "HR:%d.%d SpO2:%d.%d", bpmW, bpmF, spo2W, spo2F);
+  }
+  u8g2.drawStr(X_OFFSET + 0, 44, hrLine);
+  u8g2.drawStr(X_OFFSET + 0, 58, "Battery: --");
+  u8g2.sendBuffer();
+}
+
+void drawScreen2() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(X_OFFSET + 0, 14, "Medical Profile");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(X_OFFSET + 0, 30, "Name: --");
+  u8g2.drawStr(X_OFFSET + 0, 44, "Age: -- Blood: --");
+  u8g2.drawStr(X_OFFSET + 0, 58, "Allergy: --");
+  u8g2.sendBuffer();
+}
+
+void drawScreen3() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(X_OFFSET + 0, 14, "Emergency Contact");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(X_OFFSET + 0, 30, "Supervisor: --");
+  u8g2.drawStr(X_OFFSET + 0, 44, "Location/Sector: --");
+  u8g2.sendBuffer();
+}
+
+void drawScreen4() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x13B_tf);
+  u8g2.drawStr(X_OFFSET + 0, 14, "Diagnostics");
+  u8g2.setFont(u8g2_font_6x10_tf);
+  char line[24];
+  snprintf(line, sizeof(line), "ADXL345: %s", adxlOk ? "OK" : "FAIL");
+  u8g2.drawStr(X_OFFSET + 0, 30, line);
+  snprintf(line, sizeof(line), "MAX30100: %s", hrSensorOk ? "OK" : "FAIL");
+  u8g2.drawStr(X_OFFSET + 0, 44, line);
+  u8g2.drawStr(X_OFFSET + 0, 58, "Last Sync: --");
+  u8g2.sendBuffer();
+}
+
+void showCurrentScreen() {
+  switch (currentScreen) {
+    case 1: drawScreen1(); break;
+    case 2: drawScreen2(); break;
+    case 3: drawScreen3(); break;
+    case 4: drawScreen4(); break;
+  }
+}
+
+void handleButtonAndDisplay() {
+  bool currentButtonState = digitalRead(OLED_BUTTON_PIN);
+
+  if (currentButtonState == LOW && lastOledButtonState == HIGH) {
+    lastActivity = millis();
+    if (!displayAwake) {
+      u8g2.setPowerSave(0);
+      displayAwake = true;
+      showCurrentScreen();
+      Serial.println("Display woke up");
+    } else {
+      currentScreen++;
+      if (currentScreen > 4) currentScreen = 1;
+      showCurrentScreen();
+      Serial.print("Showing screen ");
+      Serial.println(currentScreen);
+    }
+    delay(200);
+  }
+  lastOledButtonState = currentButtonState;
+
+  if (alarmActive && !displayAwake) {
+    u8g2.setPowerSave(0);
+    displayAwake = true;
+    currentScreen = 1;
+    lastActivity = millis();
+  }
+
+  if (displayAwake && !alarmActive && (millis() - lastActivity > SLEEP_TIMEOUT)) {
+    u8g2.setPowerSave(1);
+    displayAwake = false;
+    Serial.println("Display sleeping (30s idle)");
+  }
+
+  if (displayAwake && (currentScreen == 1 || alarmActive) &&
+      (millis() - lastOledUpdate >= OLED_UPDATE_INTERVAL_MS)) {
+    showCurrentScreen();
+    lastOledUpdate = millis();
+  }
+}
+
+// ---------------- Send one telemetry packet over LoRa ----------------
+void sendTelemetry() {
+  float temperature, humidity;
+  int result = readDHT11(&temperature, &humidity);
+
+  if (result != 0) {
+    if (result == -1) Serial.println("[aries] DHT11 read timeout - check wiring");
+    if (result == -2) Serial.println("[aries] DHT11 checksum error");
+    return;
+  }
+
+  String tempStatus = classifyLevel(temperature,
+                         TEMP_EMERGENCY_LOW, TEMP_CRITICAL_LOW, TEMP_WARNING_LOW,
+                         TEMP_WARNING_HIGH, TEMP_CRITICAL_HIGH, TEMP_EMERGENCY_HIGH);
+  String humStatus = classifyLevel(humidity,
+                         HUM_EMERGENCY_LOW, HUM_CRITICAL_LOW, HUM_WARNING_LOW,
+                         HUM_WARNING_HIGH, HUM_CRITICAL_HIGH, HUM_EMERGENCY_HIGH);
+  Serial.print("[aries] Temp: "); Serial.print(temperature);
+  Serial.print(" C ["); Serial.print(tempStatus);
+  Serial.print("]  Hum: "); Serial.print(humidity);
+  Serial.print(" % ["); Serial.print(humStatus); Serial.println("]");
+
+  float aqInstantPPM, aqTwaPPM;
+  String aqMode = readMQ135(&aqInstantPPM, &aqTwaPPM);
+
+  Serial.print("[aries] AQ instant: "); Serial.print(aqInstantPPM, 1);
+  Serial.print(" ppm  TWA("); Serial.print(twaCount); Serial.print("/");
+  Serial.print(TWA_BUFFER_SIZE); Serial.print("): "); Serial.print(aqTwaPPM, 1);
+  Serial.print(" ppm  AQMODE: "); Serial.println(aqMode);
+
+  Serial.print("[aries] SOS: "); Serial.println(sosActive ? "1 (ACTIVE)" : "0");
+  Serial.print("[aries] FALL: "); Serial.println(alarmActive ? "1 (ACTIVE)" : "0");
+
+  bool hrDataValid = hrSensorOk && fingerPresent && bpmCount > 0;
+  bool spo2DataValid = hrSensorOk && fingerPresent && spo2Count > 0;
+
+  if (hrDataValid) {
+    Serial.print("[aries] HR avg: "); Serial.print(lastBPM, 1);
+    Serial.print(" bpm  SpO2 avg: "); Serial.print(lastSpO2, 1);
+    Serial.println(" %");
+  }
+
+  seqNum++;
+
+  String payload = "";
+  payload += "VER:"     + String(PROTOCOL_VERSION);
+  payload += ",BOOT:"   + String(bootId);
+  payload += ",SEQ:"    + String(seqNum);
+  payload += ",ID:"     + String(WORKER_ID);
+  payload += ",NAME:"   + String(WORKER_NAME);
+  payload += ",UPTIME:" + String(millis());
+  payload += ",AUTH:"   + String(AUTH_TOKEN);
+  payload += ",TEMP:"   + floatToStr(temperature, 1);
+  payload += ",HUM:"    + floatToStr(humidity, 1);
+  payload += ",AQPPM:"  + floatToStr(aqInstantPPM, 1);
+  payload += ",AQTWA:"  + floatToStr(aqTwaPPM, 1);
+  payload += ",AQMODE:" + aqMode;
+  payload += ",SOS:"    + String(sosActive ? 1 : 0);
+  payload += ",FALL:"   + String(alarmActive ? 1 : 0);
+
+  if (hrDataValid)   payload += ",HR:"   + floatToStr(lastBPM, 0);
+  if (spo2DataValid) payload += ",SPO2:" + floatToStr(lastSpO2, 0);
+
+  char crcHex[3];
+  sprintf(crcHex, "%02X", crc8(payload));
+  String packet = payload + ",CRC:" + String(crcHex) + "\n";
+
+  LORA_SERIAL.print(packet);
+
+  Serial.print("[aries] TX: ");
+  Serial.print(packet);
+}
+
+void setup() {
+  Serial.begin(115200);
+  LORA_SERIAL.begin(LORA_BAUD);
+  delay(2000);  // USB attach + DHT11 stabilize
+
+  pinMode(DHTPIN, INPUT);
+  pinMode(BUZZERPIN, OUTPUT);
+  pinMode(BUTTONPIN, INPUT_PULLUP);
+  digitalWrite(BUZZERPIN, LOW);
+  pinMode(OLED_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(ALARM_PIN, OUTPUT);
+  digitalWrite(ALARM_PIN, LOW);
+
+  if (RUN_CALIBRATION) {
+    calibrateR0();
+    while (true) { delay(1000); }
+  }
+
+  randomSeed(analogRead(A0));
+  bootId = (uint32_t)millis() ^ (uint32_t)random(0, 100000);
+
+  Wire.begin();
+  Wire.setClock(100000);
+
+  // ---- ADXL345 init (non-fatal) ----
+  Serial.print("Checking ADXL345...");
+  uint8_t devId = readRegister(REG_DEVID);
+  if (devId == ADXL345_DEVID_EXPECTED) {
+    adxlOk = true;
+    Serial.println("SUCCESS");
+    writeRegister(REG_POWER_CTL, 0x08);
+    writeRegister(REG_DATA_FORMAT, 0x00);
+    writeRegister(REG_BW_RATE, 0x0A);
+    calibrateVerticalAxis();
+  } else {
+    Serial.print("FAILED -- DEVID 0x");
+    Serial.print(devId, HEX);
+    Serial.println(" (expected 0xE5). Fall detection disabled for this run.");
+  }
+  lastAccelSampleMs = millis();
+
+  // ---- MAX30100 init (non-fatal) ----
+  Serial.print("Initializing MAX30100...");
+  hrSensorOk = sensor.begin();
+  if (!hrSensorOk) {
+    Serial.println("FAILED");
+    Serial.print("Part ID read: 0x");
+    Serial.println(sensor.getPartId(), HEX);
+    Serial.println("HR/SPO2 disabled for this run -- other telemetry continues normally.");
+  } else {
+    Serial.println("SUCCESS");
+
+    // Soft-reset to clear any stuck FIFO/overflow state
+    Wire.beginTransmission(MY_MAX30100_ADDR);
+    Wire.write(0x06);
+    Wire.write(0x40);
+    Wire.endTransmission();
+    delay(100);
+
+    sensor.setMode(MAX30100_MODE_SPO2_HR);
+    sensor.setLedsCurrent(MAX30100_LED_CURR_24MA, MAX30100_LED_CURR_27_1MA);
+    sensor.setLedsPulseWidth(MAX30100_SPC_PW_1600US_16BITS);
+    sensor.setSamplingRate(MAX30100_SAMPRATE_100HZ);
+    sensor.setHighresModeEnabled(true);
+    lastRangeUpdate = millis();
+
+    uint16_t flushIr, flushRed;
+    int flushed = 0;
+    while (readMaxFifoSample(&flushIr, &flushRed) && flushed < 32) flushed++;
+    Serial.print("[init] Flushed ");
+    Serial.print(flushed);
+    Serial.println(" stale FIFO samples before starting normal operation.");
+  }
+
+  u8g2.begin();
+  lastActivity = millis();
+  showCurrentScreen();
+
+  Serial.println("[aries] Unified worker safety node ready.");
+}
+
+void loop() {
+  checkSosButton();  // non-blocking, always responsive
+
+  if (hrSensorOk) {
+    clearInterruptStatus();
+    handleHeartRate();
+  }
+
+  if (adxlOk) {
+    float gx, gy, gz;
+    readAccel(gx, gy, gz);
+    float sv = sqrt(gx * gx + gy * gy + gz * gz);
+    float verticalReading = (verticalAxisIndex == 0) ? gx : (verticalAxisIndex == 1) ? gy : gz;
+
+    unsigned long now = millis();
+    float dt = (now - lastAccelSampleMs) / 1000.0;
+    lastAccelSampleMs = now;
+
+    switch (fallState) {
+      case PRE_FALL:
+        velocityIntegral = 0;
+        if (sv < LFT_G) {
+          fallState = CRITICAL_PHASE;
+          troughMs = now;
+          Serial.println(">>> SV dropped below LFT -- critical phase started");
+        }
+        break;
+
+      case CRITICAL_PHASE:
+        velocityIntegral += (sv - 1.0) * dt;
+        if (sv > UFT_G) {
+          Serial.println(">>> Impact: SV exceeded UFT -- starting posture check");
+          fallState = POST_IMPACT_POSTURE_CHECK;
+          postureCheckStartMs = now;
+        } else if (now - troughMs > IMPACT_WINDOW_MS) {
+          Serial.println("No impact within window -- resetting to PRE_FALL");
+          fallState = PRE_FALL;
+        }
+        break;
+
+      case POST_IMPACT_POSTURE_CHECK:
+        if (fabs(verticalReading - verticalBaseline) < POSTURE_CHANGE_THRESHOLD_G) {
+          postureCheckStartMs = now;
+        }
+        if (now - postureCheckStartMs >= POSTURE_HOLD_MS) {
+          digitalWrite(ALARM_PIN, HIGH);
+          alarmActive = true;
+          Serial.println("*** FALL DETECTED ***");
+          postureCheckStartMs = now;
+          fallState = PRE_FALL;
+        }
+        break;
+    }
+
+    static unsigned long alarmStartMs = 0;
+    if (alarmActive && alarmStartMs == 0) alarmStartMs = now;
+    if (alarmActive && (now - alarmStartMs >= 10000)) {
+      digitalWrite(ALARM_PIN, LOW);
+      alarmActive = false;
+      alarmStartMs = 0;
+    }
+  }
+
+  handleButtonAndDisplay();
+
+  if (millis() - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryTime = millis();
+    sendTelemetry();
+  }
+
+  delay(10);
+}
 
